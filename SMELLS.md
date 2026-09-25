@@ -129,26 +129,74 @@ same operations in the same order), not because a test checks it.
 
 One proposal for each milestone 1 smell you did not fix.
 
-### Proposal A (not coded)
+### Proposal A (not coded): take the cache out of the manager (Smell 2)
 
-**The problem.** Name it.
+**The problem.** `ReservationManager` owns a `QueryCache` that is read but never written, so
+it does nothing today. If it were wired up where it sits now, it would serve stale data,
+because the manager has to remember to invalidate it on every write path and currently does
+not.
 
-**The decomposition.** What are the pieces, what does each own, and where do the rules live?
+**The decomposition.** Step 1: delete the `cache` field, its construction and the lookup in
+`listBookingsForRoom`, plus the unused `withTtl`/`disabled` helpers. Behavior is identical
+because the lookup always misses today. Step 2, only if a cache is ever actually needed: put
+it behind the persistence boundary as a `CachingStorageProvider implements StorageProvider`
+that wraps another provider. That layer owns the invalidation rule ("any `save` or `update`
+for room X drops `bookings:X`"), because it is the one place that sees every write. The
+manager goes back to only talking to `StorageProvider` and does not know caching exists.
 
-**One cost.** Something this actually costs. "No real downside" is not a cost.
+**One cost.** The decorator has to keep the storage contract that callers get their own
+copies. `InMemoryStorageProvider` returns fresh copies on every read, but a naive cache hands
+out the same array each time, so one caller mutating a result would corrupt the next caller's
+read. Getting that right means copying on every cache hit, which gives back part of the speed
+the cache was meant to buy. It is also one more layer to set up in every test and every
+production wiring.
 
-### Proposal B (not coded)
+### Proposal B (not coded): a `TimeRange` value type (Smell 3)
 
-**The problem.**
+**The problem.** Time windows are passed around as bare `start, end` number pairs, so the
+half-open interval rule (touching endpoints do not overlap) is re-derived in
+`ReservationManager.hasConflict`, `availability.isSlotFree`, `availability.freeMinutes`,
+`ReportGenerator.overlapsWindow` and the clipping loop in `ReportGenerator.occupancy`.
 
-**The decomposition.**
+**The decomposition.** A new `src/timeRange.ts` with an immutable `TimeRange { start; end }`
+plus `overlaps(a, b)`, `clip(range, window)` and `durationMinutes(range)`. That file is the
+only owner of interval semantics. `hasConflict`, `isSlotFree` and `overlapsWindow` become
+one-line calls to `overlaps` (or disappear). `occupancy` and `freeMinutes` use `clip`.
+`Booking` and `ReservationRequest` keep their `start`/`end` fields for now, and call sites
+build a range from them, so the public data shapes and the tests do not move in the first pass.
 
-**One cost.**
+**One cost.** During the transition there are two ways to represent a time window: raw fields
+on `Booking` and `TimeRange` in the logic. Every call site pays a small conversion, and a
+reader has to know both. Finishing the job by giving `Booking` a `range` field instead would
+be a breaking change to the exported types, the storage rows, the test fixtures and every
+caller of the exported `isSlotFree`.
 
 ### The thing that looks smelly but is fine
 
-**What it is.** File and method.
+**What it is.** `src/storage/storageProvider.ts`, the `StorageProvider` interface, which has
+exactly one implementation (`InMemoryStorageProvider`).
 
-**Why it is fine.** Defend it with properties of the code, not with its line count.
+**Why it is fine.** "An interface with a single implementation" is the textbook trigger for
+speculative generality, and it has the same shape as the notifier factory, which really is
+speculative. The difference is that this interface is an actual seam in use:
+- `ReservationManager`'s constructor takes a `StorageProvider`, so callers choose the
+  implementation.
+- `ReportGenerator` depends only on the interface.
+- The test fixture (`tests/fixtures.ts` `newService`) builds one provider and shares that same
+  instance between the manager and the report generator. That is exactly the dependency
+  injection the interface exists to allow.
 
-**What would flip your verdict.** Name the change that would turn this into a real problem.
+The interface is also narrow and describes only what callers need (save, update, three
+finders), and it hides a real decision: where bookings live. Compare the notifier: the manager
+hard-codes `createNotificationChannel(DEFAULT_NOTIFIER_CONFIG)`, so that abstraction has no
+place for another implementation to plug in. That difference, not the number of
+implementations, is what separates the two.
+
+**What would flip your verdict.** If `ReservationManager` stopped accepting a provider and
+built `new InMemoryStorageProvider()` internally, the way it builds its notifier, the interface
+would become pure ceremony with nothing ever plugging in. It would also flip if the interface
+started encoding in-memory assumptions a real store cannot meet. It is fully synchronous and
+promises fresh copies on every read, so the first real database implementation would force
+every method to return a `Promise`. At that point the abstraction was shaped around its one
+implementation rather than around what callers need. (Minor: `clear()` has no caller in `src/` or
+`tests/`. It is unused API worth trimming, but not a reason to condemn the interface.)
